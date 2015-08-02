@@ -84,16 +84,16 @@ public class ServerCoordinator {
     }
     
     /**
-     * This task should be runned async as it uses the network and might induce high latency
+     * This task should be run async as it uses the network and might induce high latency
      */
     class UpdateProxyPlayerCountTask implements Runnable{
         final Pinger ping = new Pinger("bungee", BPC.getInstance().getConf().getProxyAddress());
         
         @Override
         public void run() {
-            ping.run();
-            if(ping.isOnline()){
-                bungeeMaxPlayer = ping.getMaxPlayers();
+            PingResponse pingResponse = ping.call();
+            if (pingResponse != null) {
+                bungeeMaxPlayer = pingResponse.getPlayers().getMax();
             }
         }
             

@@ -1,311 +1,253 @@
 package fr.Alphart.BungeePlayerCounter.Servers;
 
-import java.io.ByteArrayOutputStream;
+import com.google.common.base.Charsets;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.lang.reflect.Method;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.net.URL;
-import java.net.URLClassLoader;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
-import java.util.List;
-
-import lombok.Getter;
-import lombok.Setter;
-import lombok.ToString;
 
 import com.google.gson.Gson;
 
 import fr.Alphart.BungeePlayerCounter.BPC;
-import fr.Alphart.BungeePlayerCounter.Servers.Pinger.VarIntStreams.VarIntDataInputStream;
-import fr.Alphart.BungeePlayerCounter.Servers.Pinger.VarIntStreams.VarIntDataOutputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.util.concurrent.Callable;
 
-public class Pinger implements Runnable {
-    private static Gson gson;
-	private InetSocketAddress address;
-	private String parentGroupName;
-	private boolean online = false;
-	private int maxPlayers = -1;
+public class Pinger implements Callable<PingResponse> {
+    private static final long PING_PAYLOAD = 0xdecafcafebabeL;
+    private static final int PROCOL_VERSION = 4; // 1.7.2 protocol version
+    private static final int MAX_PACKET_LENGTH = 0x10000; // 64kb
+    private static final Gson gson = new Gson();
+    private final InetSocketAddress address;
+    private final String parentGroupName;
+    private final byte[] handshakePacket;
+    private final byte[] requestPacket;
+    private final byte[] pingPacket;
 
-	public Pinger(final String parentGroupName, final InetSocketAddress address) {
-	    if(gson == null){
-	        loadGson();
-	        try{
-	            gson = new Gson();
-	            BPC.debug("Gson was loaded with success !");
-	        }catch(final Throwable t){
-	            BPC.severe("Gson cannot be downloaded or loaded ... Please update to spigot 1.8.3 or earlier", t);
-	        }
-	    }
-		this.parentGroupName = parentGroupName;
-		this.address = address;
-	}
-	
-	public boolean isOnline() {
-		return online;
-	}
-	
+    public Pinger(final String parentGroupName, final InetSocketAddress address) {
+        this.parentGroupName = parentGroupName;
+        this.address = address;
+        handshakePacket = createQueryPacket();
+        requestPacket = createRequestPacket();
+        pingPacket = createPingPacket();
+    }
 
-	public int getMaxPlayers() {
-		return maxPlayers;
-	}
-
-	@Override
-	public void run() {
-		try {
-		    final PingResponse response = ping(address, 1000);
-		    online = true;
-		    maxPlayers = response.getPlayers().getMax();
-		    BPC.debug("Successfully pinged " + parentGroupName + " group, result : " + response);
-		} catch (IOException e) {
-			if (!(e instanceof ConnectException) && !(e instanceof SocketTimeoutException)) {
-			    BPC.severe("An unexcepted error occured while pinging " + parentGroupName + " server", e);
-			}
-			online = false;
-		}
-	}
-    public static PingResponse ping(final InetSocketAddress host, final int timeout) throws IOException{
-        Socket socket = null;
-        try{
-            socket = new Socket();
-            OutputStream outputStream;
-            VarIntDataOutputStream dataOutputStream;
-            InputStream inputStream;
-            InputStreamReader inputStreamReader;
-    
-            socket.setSoTimeout(timeout);
-    
-            socket.connect(host, timeout);
-    
-            outputStream = socket.getOutputStream();
-            dataOutputStream = new VarIntDataOutputStream(outputStream);
-    
-            inputStream = socket.getInputStream();
-            inputStreamReader = new InputStreamReader(inputStream);
-    
-            // Write handshake, protocol=4 and state=1
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            VarIntDataOutputStream handshake = new VarIntDataOutputStream(b);
-            handshake.writeByte(0x00);
-            handshake.writeVarInt(4);
-            handshake.writeVarInt(host.getHostString().length());
-            handshake.writeBytes(host.getHostString());
-            handshake.writeShort(host.getPort());
-            handshake.writeVarInt(1);
-            dataOutputStream.writeVarInt(b.size());
-            dataOutputStream.write(b.toByteArray());
-    
-            // Send ping request
-            dataOutputStream.writeVarInt(1);
-            dataOutputStream.writeByte(0x00);
-            VarIntDataInputStream dataInputStream = new VarIntDataInputStream(inputStream);
-            dataInputStream.readVarInt();
-            int id = dataInputStream.readVarInt();
-            if (id == -1) {
-                throw new IOException("Premature end of stream.");
-            }
-            if (id != 0x00) {
-                throw new IOException(String.format("Invalid packetID. Expecting %d got %d", 0x00, id));
-            }
-            int length = dataInputStream.readVarInt();
-            if (length == -1) {
-                throw new IOException("Premature end of stream.");
-            }
-    
-            if (length == 0) {
-                throw new IOException("Invalid string length.");
-            }
-            
-            // Read ping response
-            byte[] in = new byte[length];
-            dataInputStream.readFully(in);
-            String json = new String(in);
-            
-            // Send ping packet (to get ping value in ms)
-            long now = System.currentTimeMillis();
-            dataOutputStream.writeByte(0x09);
-            dataOutputStream.writeByte(0x01);
-            dataOutputStream.writeLong(now);
-    
-            // Read ping value in ms
-            dataInputStream.readVarInt();
-            id = dataInputStream.readVarInt();
-            if (id == -1) {
-                throw new IOException("Premature end of stream.");
-            }
-            if (id != 0x01) {
-                throw new IOException(String.format("Invalid packetID. Expecting %d got %d", 0x01, id));
-            }
-            long pingtime = dataInputStream.readLong();
-    
-            synchronized (gson) {
-                final PingResponse response = gson.fromJson(json, PingResponse.class);
-                response.setTime((int) (now - pingtime));
-                dataOutputStream.close();
-                outputStream.close();
-                inputStreamReader.close();
-                inputStream.close();
-                socket.close();
-                return response;
-            }
-        }catch(final IOException e){
-            throw e;
-        }finally{
-            if(socket != null){
-                socket.close();
-            }
+    private byte[] createQueryPacket() {
+        try {
+            // See http://wiki.vg/index.php?title=Protocol&oldid=5486#Handshake
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            MCDataOutputStream dataOut = new MCDataOutputStream(out);
+            dataOut.writeVarInt(0); // Packet id
+            dataOut.writeVarInt(PROCOL_VERSION); // Protocol version.
+            dataOut.writeMCString(address.getHostString());
+            dataOut.writeShort(address.getPort());
+            dataOut.writeVarInt(1);
+            return out.toByteArray();
+        } catch (IOException ex) {
+            // Should not happen.
+            throw new IllegalStateException(ex);
         }
     }
-    
-    public Gson loadGson(){
-        try{
-            Class.forName("com.google.gson.Gson");
-            return new Gson();
-        }catch(final Throwable t){
-            BPC.info("Gson wasn't found... Please update to spigot 1.8.3 or earlier."
-                    + "BPC will try to dynamically load it.");
-        }
-        final File bpcFolder = BPC.getInstance().getDataFolder();
-        final File gsonPath = new File(bpcFolder + File.separator + "lib" + File.separator
-                + "gson.jar");
-        new File(bpcFolder + File.separator + "lib").mkdir();
 
-        // Download the driver if it doesn't exist
-        if (!gsonPath.exists()) {
-            BPC.info("Gson was not found. It is being downloaded, please wait ...");
-
-            final String gsonDL = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.3.1/gson-2.3.1.jar";
-            FileOutputStream fos = null;
-            try {
-                final ReadableByteChannel rbc = Channels.newChannel(new URL(gsonDL).openStream());
-                fos = new FileOutputStream(gsonPath);
-                fos.getChannel().transferFrom(rbc, 0, Long.MAX_VALUE);
-            } catch (final IOException e) {
-                BPC.severe("An error occured during the download of Gson.", e);
-                return null;
-            } finally {
-                if(fos != null){
-                    try {
-                        fos.close();
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-            BPC.info("Gson has been successfully downloaded.");
-        }
-
+    private byte[] createRequestPacket() {
         try {
-            URLClassLoader systemClassLoader;
-            URL gsonUrl;
-            Class<URLClassLoader> sysclass;
-            gsonUrl = gsonPath.toURI().toURL();
-            systemClassLoader = (URLClassLoader) ClassLoader.getSystemClassLoader();
-            sysclass = URLClassLoader.class;
-            final Method method = sysclass.getDeclaredMethod("addURL", new Class[] { URL.class });
-            method.setAccessible(true);
-            method.invoke(systemClassLoader, new Object[] { gsonUrl });
+            // See http://wiki.vg/index.php?title=Protocol&oldid=5486#Request
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            MCDataOutputStream dataOut = new MCDataOutputStream(out);
+            dataOut.writeVarInt(0); // Packet id
+            return out.toByteArray();
+        } catch (IOException ex) {
+            // Should not happen.
+            throw new IllegalStateException(ex);
+        }
+    }
 
-            return (Gson) Class.forName("com.google.gson.Gson", true, systemClassLoader).newInstance();
-        } catch (final Throwable t) {
-            BPC.severe("Gson cannot be loaded.", t);
+    private byte[] createPingPacket() {
+        try {
+            // See http://wiki.vg/index.php?title=Protocol&oldid=5486#Ping_2
+            // the protocol document states that we should send a time
+            // here, however whatever we send is returned by the server
+            // in the ping response, so lets just pick an easily identifiable
+            // number.
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            MCDataOutputStream dataOut = new MCDataOutputStream(out);
+            dataOut.writeVarInt(0); // Packet id
+            dataOut.writeLong(PING_PAYLOAD); // 
+            return out.toByteArray();
+        } catch (IOException ex) {
+            // Should not happen.
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    @Override
+    public PingResponse call() {
+        try {
+            final PingResponse response = ping(address, 1000);
+            BPC.debug("Successfully pinged " + parentGroupName + " group, result : " + response);
+            return response;
+        } catch (IOException e) {
+            if (!(e instanceof ConnectException) && !(e instanceof SocketTimeoutException)) {
+                BPC.severe("An unexcepted error occured while pinging " + parentGroupName + " server", e);
+            }
         }
         return null;
     }
-    
-    @Getter
-    @ToString
-    public class PingResponse {
-        private String description;
-        private Players players;
-        private Version version;
-        private String favicon;
-        @Setter
-        private int time;
-        
-        public boolean isFull(){
-            return players.max <= players.online;
-        }
-        
-        @Getter
-        @ToString
-        public class Players {
-            private int max;
-            private int online;
-            private List<Player> sample;
-            
-            @Getter
-            public class Player {
-                private String name;
-                private String id;
 
-            }
-        }
-        
-        @Getter
-        @ToString
-        public class Version {
-            private String name;
-            private String protocol;
-        }
-    }
-    
-    static class VarIntStreams {
-        /**
-         * Enhanced DataIS which reads VarInt type
-         */
-        public static class VarIntDataInputStream extends DataInputStream{
+    public PingResponse ping(final InetSocketAddress host, final int timeout) throws IOException {
+        Socket socket = null;
+        try {
+            MCDataOutputStream dataOutputStream;
+            MCDataInputStream dataInputStream;
+            String json;
+            byte[] packet;
+            MCDataInputStream packetIn;
+            long pingTimestamp;
+            long pongTimestamp;
+            long pongPayload;
+            int pktId;
 
-            public VarIntDataInputStream(final InputStream is) {
-                super(is);
-            }
-            
-            public int readVarInt() throws IOException {
-                int i = 0;
-                int j = 0;
-                while (true) {
-                    int k = readByte();
-                    i |= (k & 0x7F) << j++ * 7;
-                    if (j > 5)
-                        throw new RuntimeException("VarInt too big");
-                    if ((k & 0x80) != 128)
-                        break;
-                }
-                return i;
-            }
-            
-        }
-        /**
-         * Enhanced DataOS which writes VarInt type
-         */
-        public static class VarIntDataOutputStream extends DataOutputStream{
+            socket = new Socket();
 
-            public VarIntDataOutputStream(final OutputStream os) {
-                super(os);
-            }
-            
-            public void writeVarInt(int paramInt) throws IOException {
-                while (true) {
-                    if ((paramInt & 0xFFFFFF80) == 0) {
-                        writeByte(paramInt);
-                        return;
-                    }
+            socket.setSoTimeout(timeout);
 
-                    writeByte(paramInt & 0x7F | 0x80);
-                    paramInt >>>= 7;
-                }
+            socket.connect(host, timeout);
+
+            dataOutputStream = new MCDataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 2048));
+            dataInputStream = new MCDataInputStream(socket.getInputStream());
+
+            // Write handshake + request
+            dataOutputStream.writePacket(handshakePacket);
+            dataOutputStream.writePacket(requestPacket);
+            dataOutputStream.flush();
+
+            // Read handshake response.
+            packet = dataInputStream.readPacket();
+            packetIn = new MCDataInputStream(new ByteArrayInputStream(packet));
+            pktId = packetIn.readVarInt();
+            if (pktId != 0) {
+                throw new IOException("Server sent unexpected response to handshake, expected packet id: 0 got: " + pktId);
+            }
+            json = packetIn.readMCString(); // Grab the ping response.
+
+
+            // Write ping request
+            dataOutputStream.writePacket(pingPacket);
+            dataOutputStream.flush();
+            pingTimestamp = System.nanoTime(); // Record time of sending the ping
+
+            // Read ping response.
+            packet = dataInputStream.readPacket();
+            pongTimestamp = System.nanoTime(); // Record time of receiving the response
+            packetIn = new MCDataInputStream(new ByteArrayInputStream(packet));
+            pktId = packetIn.readVarInt();
+            if (pktId != 1) {
+                throw new IOException("Server sent unexpected response to ping, expected packet id: 1 got: " + pktId);
+            }
+            pongPayload = packetIn.readLong();
+            if (PING_PAYLOAD != pongPayload) {
+                // Hack to print returned ping response as an unsigned 64 bit long in hex.
+                throw new IOException(String.format("Expected ping response payload 0x%x got 0x%x%x", PING_PAYLOAD, (pongPayload>>32)&0xFFFFFFFFL, pongPayload&0xFFFFFFFFL));
+            }
+
+            synchronized (gson) {
+                final PingResponse response = gson.fromJson(json, PingResponse.class);
+                response.setTime(pongTimestamp - pingTimestamp);
+                return response;
+            }
+        } catch (final IOException e) {
+            throw e;
+        } finally {
+            if (socket != null) {
+                socket.close();
             }
         }
     }
-    
+
+
+
+    /**
+     * Enhanced DataIS which reads VarInt type
+     */
+    public final static class MCDataInputStream extends DataInputStream {
+
+        public MCDataInputStream(final InputStream is) {
+            super(is);
+        }
+
+        public int readVarInt() throws IOException {
+            int i = 0;
+            int j = 0;
+            while (true) {
+                int k = readByte();
+                i |= (k & 0x7F) << j++ * 7;
+                if (j > 5) {
+                    throw new IOException("VarInt too big");
+                }
+                if ((k & 0x80) != 0x80) {
+                    return i;
+                }
+            }
+        }
+
+        public String readMCString() throws IOException {
+            int strlen = readVarInt();
+            byte[] stringData = new byte[strlen];
+            readFully(stringData);
+            return new String(stringData, Charsets.UTF_8);
+        }
+
+        public byte[] readPacket() throws IOException {
+            int pktLen = readVarInt();
+            if (pktLen <= 0 || pktLen > MAX_PACKET_LENGTH) {
+                throw new IOException("Packet length invalid, expected 0 < length <= " + MAX_PACKET_LENGTH + " got length: " + pktLen);
+            }
+            byte[] packet = new byte[pktLen];
+            readFully(packet);
+            return packet;
+        }
+
+    }
+
+    /**
+     * Enhanced DataOS which writes VarInt type
+     */
+    public final static class MCDataOutputStream extends DataOutputStream {
+
+        public MCDataOutputStream(final OutputStream os) {
+            super(os);
+        }
+
+        public void writeVarInt(int paramInt) throws IOException {
+            while (true) {
+                if ((paramInt & 0xFFFFFF80) == 0) {
+                    writeByte(paramInt);
+                    return;
+                }
+
+                writeByte(paramInt & 0x7F | 0x80);
+                paramInt >>>= 7;
+            }
+        }
+
+        public void writeMCString(String s) throws IOException {
+            byte[] stringData = s.getBytes(Charsets.UTF_8);
+            writeVarInt(stringData.length);
+            write(stringData);
+        }
+
+        public void writePacket(byte[] pkt) throws IOException {
+            if (pkt.length == 0 || pkt.length > MAX_PACKET_LENGTH) {
+                throw new IOException("Packet length invalid, expected 0 < length <= " + MAX_PACKET_LENGTH + " got length: " + pkt.length);
+            }
+            writeVarInt(pkt.length);
+            write(pkt);
+        }
+    }
 }
